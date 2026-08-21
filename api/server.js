@@ -1,7 +1,13 @@
 const express = require('express');
 const { Pool } = require('pg');
 const { encryptKey, decryptKey } = require('./kms-service');
-const { createApiKeyAuth } = require('./security');
+const {
+  createApiKeyAuth,
+  createClaimToken,
+  hashClaimToken,
+  claimTokenMatches,
+  getClaimLeaseSeconds,
+} = require('./security');
 const {
   normalizeNetwork,
   normalizePattern,
@@ -70,8 +76,17 @@ app.get('/api/v1/request_address', requirePlatformAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+
+    // Expired assignments are safe to return to inventory because the private
+    // key never left the encrypted store unless claim_address completed.
+    await client.query(
+      `UPDATE vanity_keys
+       SET status = 'available', assigned_at = NULL, claim_token_hash = NULL, lease_expires_at = NULL
+       WHERE status = 'assigned' AND lease_expires_at IS NOT NULL AND lease_expires_at <= NOW()`,
+    );
+
     const result = await client.query(
-      `SELECT public_key
+      `SELECT id, public_key
        FROM vanity_keys
        WHERE status = 'available' AND pattern = $1 AND network = $2
        ORDER BY id
@@ -85,15 +100,27 @@ app.get('/api/v1/request_address', requirePlatformAuth, async (req, res) => {
       return res.status(404).json({ error: 'No available address for this pattern and network.' });
     }
 
-    const publicKey = result.rows[0].public_key;
+    const claimToken = createClaimToken();
+    const claimTokenHash = hashClaimToken(claimToken);
+    const leaseSeconds = getClaimLeaseSeconds();
+    const leaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000);
+    const { id, public_key: publicKey } = result.rows[0];
+
     await client.query(
       `UPDATE vanity_keys
-       SET status = 'assigned', assigned_at = NOW()
-       WHERE public_key = $1`,
-      [publicKey],
+       SET status = 'assigned', assigned_at = NOW(), claim_token_hash = $1, lease_expires_at = $2
+       WHERE id = $3`,
+      [claimTokenHash, leaseExpiresAt.toISOString(), id],
     );
     await client.query('COMMIT');
-    res.json({ publicKey, network, pattern });
+
+    res.json({
+      publicKey,
+      network,
+      pattern,
+      claimToken,
+      leaseExpiresAt: leaseExpiresAt.toISOString(),
+    });
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Error requesting address:', error.message);
@@ -104,30 +131,36 @@ app.get('/api/v1/request_address', requirePlatformAuth, async (req, res) => {
 });
 
 app.post('/api/v1/claim_address', requirePlatformAuth, async (req, res) => {
-  const { publicKey } = req.body || {};
+  const { publicKey, claimToken } = req.body || {};
   if (typeof publicKey !== 'string' || publicKey.length < 3 || publicKey.length > 255) {
     return res.status(400).json({ error: 'A valid publicKey is required.' });
+  }
+  if (!hashClaimToken(claimToken)) {
+    return res.status(400).json({ error: 'A valid claimToken is required.' });
   }
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const result = await client.query(
-      `SELECT encrypted_payload
+      `SELECT encrypted_payload, claim_token_hash, lease_expires_at
        FROM vanity_keys
        WHERE status = 'assigned' AND public_key = $1
        FOR UPDATE`,
       [publicKey],
     );
 
-    if (result.rows.length === 0) {
-      await client.query('COMMIT');
-      return res.status(404).json({ error: 'Address not found, not assigned, or already claimed.' });
+    const row = result.rows[0];
+    const leaseIsLive = row?.lease_expires_at && new Date(row.lease_expires_at).getTime() > Date.now();
+    if (!row || !leaseIsLive || !claimTokenMatches(claimToken, row.claim_token_hash)) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Address claim is unavailable or expired.' });
     }
 
-    // The row lock makes key release single-consumer. If decryption fails, the
-    // transaction rolls back and the encrypted inventory remains recoverable.
-    const privateKey = await decryptKey(result.rows[0].encrypted_payload);
+    // The row lock and one-time lease token make key release single-consumer and
+    // bind release to the allocation response that created this assignment.
+    // If decryption fails, the transaction rolls back and encrypted inventory remains.
+    const privateKey = await decryptKey(row.encrypted_payload);
     await client.query('DELETE FROM vanity_keys WHERE public_key = $1', [publicKey]);
     await client.query('COMMIT');
     res.json({ privateKey });
