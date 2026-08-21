@@ -1,6 +1,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { constantTimeEqual } = require('../security');
+const {
+  constantTimeEqual,
+  createClaimToken,
+  hashClaimToken,
+  claimTokenMatches,
+  getClaimLeaseSeconds,
+} = require('../security');
 const {
   normalizeNetwork,
   normalizePattern,
@@ -12,6 +18,28 @@ test('constantTimeEqual accepts equal secrets and rejects mismatches', () => {
   assert.equal(constantTimeEqual('a'.repeat(32), 'a'.repeat(32)), true);
   assert.equal(constantTimeEqual('a'.repeat(32), 'b'.repeat(32)), false);
   assert.equal(constantTimeEqual('short', 'a'.repeat(32)), false);
+});
+
+test('claim tokens are random, hashable, and verified without plaintext storage', () => {
+  const first = createClaimToken();
+  const second = createClaimToken();
+  assert.notEqual(first, second);
+  assert.ok(first.length >= 32);
+
+  const firstHash = hashClaimToken(first);
+  assert.match(firstHash, /^[0-9a-f]{64}$/);
+  assert.notEqual(firstHash, first);
+  assert.equal(claimTokenMatches(first, firstHash), true);
+  assert.equal(claimTokenMatches(second, firstHash), false);
+  assert.equal(hashClaimToken('short'), null);
+});
+
+test('claim lease duration is bounded to a safe operational window', () => {
+  assert.equal(getClaimLeaseSeconds(undefined), 600);
+  assert.equal(getClaimLeaseSeconds('120'), 120);
+  assert.equal(getClaimLeaseSeconds('1'), 60);
+  assert.equal(getClaimLeaseSeconds('99999'), 3600);
+  assert.equal(getClaimLeaseSeconds('not-a-number'), 600);
 });
 
 test('network and pattern normalization are strict', () => {
