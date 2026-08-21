@@ -1,118 +1,145 @@
 const express = require('express');
 const { Pool } = require('pg');
 const { encryptKey, decryptKey } = require('./kms-service');
+const { createApiKeyAuth } = require('./security');
+const {
+  normalizeNetwork,
+  normalizePattern,
+  isValidPublicKey,
+  isReasonablePrivateKey,
+} = require('./validation');
 require('dotenv').config();
+
 const app = express();
-app.use(express.json());
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-const PORT = process.env.PORT || 3000;
-const WORKER_API_KEY = process.env.WORKER_API_KEY;
-const requireWorkerAuth = (req, res, next) => {
-  const apiKey = req.get('x-api-key');
-  if (apiKey && apiKey === WORKER_API_KEY) {
-    next();
-  } else {
-    res.status(401).json({ error: 'Unauthorized' });
-  }
-};
-const requirePlatformAuth = (req, res, next) => {
-  console.log("Platform auth placeholder: allowing request.");
+app.disable('x-powered-by');
+app.use(express.json({ limit: '32kb' }));
+app.use('/api/', (_req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
   next();
-};
+});
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const PORT = Number(process.env.PORT || 3000);
+const requireWorkerAuth = createApiKeyAuth({ envName: 'WORKER_API_KEY' });
+const requirePlatformAuth = createApiKeyAuth({ envName: 'PLATFORM_API_KEY' });
+
+app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+
 app.post('/api/v1/submit_keypair', requireWorkerAuth, async (req, res) => {
-  const { publicKey, privateKey, network } = req.body;
-  
-  if (!publicKey || !privateKey || !network) {
-    return res.status(400).json({ error: 'Missing required fields: publicKey, privateKey, network' });
+  const { publicKey, privateKey } = req.body || {};
+  const network = normalizeNetwork(req.body?.network);
+
+  if (!network) {
+    return res.status(400).json({ error: 'network must be either evm or solana.' });
   }
-  if (typeof publicKey !== 'string' || publicKey.length < 3) {
-    return res.status(400).json({ error: 'Invalid publicKey format' });
+  if (!isValidPublicKey(publicKey, network)) {
+    return res.status(400).json({ error: `Invalid ${network} public key.` });
   }
-  
+  if (!isReasonablePrivateKey(privateKey)) {
+    return res.status(400).json({ error: 'Invalid private key payload.' });
+  }
+
   const pattern = publicKey.slice(-3).toLowerCase();
+
   try {
     const encryptedPayload = await encryptKey(privateKey);
-    const query = `
-      INSERT INTO vanity_keys(public_key, encrypted_payload, network, pattern)
-      VALUES($1, $2, $3, $4) RETURNING id;
-    `;
-    await pool.query(query, [publicKey, encryptedPayload, network, pattern]);
-    console.log(`Successfully stored key for pattern: ${pattern}`);
-    res.status(201).json({ success: true, publicKey });
+    await pool.query(
+      `INSERT INTO vanity_keys(public_key, encrypted_payload, network, pattern)
+       VALUES($1, $2, $3, $4)`,
+      [publicKey, encryptedPayload, network, pattern],
+    );
+    res.status(201).json({ success: true, publicKey, network, pattern });
   } catch (error) {
-    console.error("Error storing key:", error.message);
-    res.status(500).json({ error: 'Failed to store key' });
+    if (error.code === '23505') {
+      return res.status(409).json({ error: 'Keypair already exists.' });
+    }
+    console.error('Error storing key:', error.message);
+    res.status(500).json({ error: 'Failed to store key.' });
   }
 });
+
 app.get('/api/v1/request_address', requirePlatformAuth, async (req, res) => {
-    const { pattern } = req.query;
-    
-    if (!pattern || typeof pattern !== 'string') {
-        return res.status(400).json({ error: 'Missing or invalid pattern query parameter' });
+  const pattern = normalizePattern(req.query.pattern);
+  const network = normalizeNetwork(req.query.network);
+
+  if (!pattern || !network) {
+    return res.status(400).json({ error: 'Valid pattern and network query parameters are required.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      `SELECT public_key
+       FROM vanity_keys
+       WHERE status = 'available' AND pattern = $1 AND network = $2
+       ORDER BY id
+       LIMIT 1
+       FOR UPDATE SKIP LOCKED`,
+      [pattern, network],
+    );
+
+    if (result.rows.length === 0) {
+      await client.query('COMMIT');
+      return res.status(404).json({ error: 'No available address for this pattern and network.' });
     }
-    
-    try {
-        const client = await pool.connect();
-        try {
-            await client.query('BEGIN');
-            const findQuery = `
-                SELECT public_key FROM vanity_keys
-                WHERE status = 'available' AND pattern = $1
-                LIMIT 1 FOR UPDATE SKIP LOCKED;
-            `;
-            const result = await client.query(findQuery, [pattern.toLowerCase()]);
-            if (result.rows.length === 0) {
-                await client.query('COMMIT');
-                return res.status(404).json({ error: 'No available address for this pattern.' });
-            }
-            const publicKey = result.rows[0].public_key;
-            const updateQuery = `
-                UPDATE vanity_keys SET status = 'assigned', assigned_at = NOW()
-                WHERE public_key = $1;
-            `;
-            await client.query(updateQuery, [publicKey]);
-            await client.query('COMMIT');
-            res.json({ publicKey });
-        } catch (e) {
-            await client.query('ROLLBACK');
-            throw e;
-        } finally {
-            client.release();
-        }
-    } catch (error) {
-        console.error("Error requesting address:", error.message);
-        res.status(500).json({ error: 'Server error' });
-    }
+
+    const publicKey = result.rows[0].public_key;
+    await client.query(
+      `UPDATE vanity_keys
+       SET status = 'assigned', assigned_at = NOW()
+       WHERE public_key = $1`,
+      [publicKey],
+    );
+    await client.query('COMMIT');
+    res.json({ publicKey, network, pattern });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error requesting address:', error.message);
+    res.status(500).json({ error: 'Server error.' });
+  } finally {
+    client.release();
+  }
 });
+
 app.post('/api/v1/claim_address', requirePlatformAuth, async (req, res) => {
-    const { publicKey } = req.body;
-    
-    if (!publicKey || typeof publicKey !== 'string') {
-        return res.status(400).json({ error: 'Missing or invalid publicKey in request body' });
+  const { publicKey } = req.body || {};
+  if (typeof publicKey !== 'string' || publicKey.length < 3 || publicKey.length > 255) {
+    return res.status(400).json({ error: 'A valid publicKey is required.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      `SELECT encrypted_payload
+       FROM vanity_keys
+       WHERE status = 'assigned' AND public_key = $1
+       FOR UPDATE`,
+      [publicKey],
+    );
+
+    if (result.rows.length === 0) {
+      await client.query('COMMIT');
+      return res.status(404).json({ error: 'Address not found, not assigned, or already claimed.' });
     }
-    
-    try {
-        const query = `
-            SELECT encrypted_payload FROM vanity_keys
-            WHERE status = 'assigned' AND public_key = $1;
-        `;
-        const result = await pool.query(query, [publicKey]);
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: 'Address not found, not assigned, or already claimed.' });
-        }
-        const encryptedPayload = result.rows[0].encrypted_payload;
-        const privateKey = await decryptKey(encryptedPayload);
-        const deleteQuery = `DELETE FROM vanity_keys WHERE public_key = $1;`;
-        await pool.query(deleteQuery, [publicKey]);
-        console.log(`Key ${publicKey} claimed and purged.`);
-        res.json({ privateKey });
-    } catch (error) {
-        console.error("Error claiming address:", error.message);
-        res.status(500).json({ error: 'Server error' });
-    }
+
+    // The row lock makes key release single-consumer. If decryption fails, the
+    // transaction rolls back and the encrypted inventory remains recoverable.
+    const privateKey = await decryptKey(result.rows[0].encrypted_payload);
+    await client.query('DELETE FROM vanity_keys WHERE public_key = $1', [publicKey]);
+    await client.query('COMMIT');
+    res.json({ privateKey });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error claiming address:', error.message);
+    res.status(500).json({ error: 'Server error.' });
+  } finally {
+    client.release();
+  }
 });
+
 app.listen(PORT, () => {
   console.log(`Vanity Factory API listening on port ${PORT}`);
 });
-
-
