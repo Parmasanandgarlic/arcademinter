@@ -1,6 +1,6 @@
 # Arcademinter
 
-Arcademinter is **reference infrastructure for generating and allocating Solana and EVM vanity addresses without storing private keys in plaintext**. GPU workers generate candidate keypairs, a Node/Express factory API envelope-encrypts private-key material with AWS KMS, and PostgreSQL provides concurrency-safe inventory allocation.
+Arcademinter is **reference infrastructure for generating and allocating Solana and EVM vanity addresses without storing private keys in plaintext**. GPU workers generate candidate keypairs, a Node/Express factory API envelope-encrypts private-key material with AWS KMS, and PostgreSQL provides concurrency-safe inventory allocation and expiring one-time claims.
 
 The project is useful as a compact example of key-material handling, distributed GPU workers, envelope encryption and transactional resource allocation. It should be treated as security-sensitive infrastructure, not as a turnkey custody service.
 
@@ -16,12 +16,14 @@ Factory API
 ├── worker authentication
 ├── platform/key-delivery authentication
 ├── input validation
+├── one-time claim-token issuance
 └── AWS KMS envelope encryption
         │
         ▼
 PostgreSQL vanity-key inventory
 ├── available → assigned lifecycle
 ├── FOR UPDATE SKIP LOCKED allocation
+├── hashed + expiring claim leases
 └── single-consumer claim + purge
 ```
 
@@ -34,6 +36,8 @@ Arcademinter deliberately separates two credentials:
 
 Both privileged boundaries fail closed if their configured secret is missing or shorter than 32 characters. They should be independently generated and distributed to different principals.
 
+The shared platform credential is not, by itself, sufficient to release an assigned private key. Each allocation also creates a cryptographically random, one-time claim token. Only its SHA-256 hash is persisted, and the lease expires automatically if the allocation is not claimed.
+
 ## Key lifecycle
 
 1. A miner generates a vanity keypair.
@@ -42,7 +46,9 @@ Both privileged boundaries fail closed if their configured secret is missing or 
 4. The private key is encrypted locally with AES-256-GCM; only the KMS-encrypted data key and ciphertext are stored.
 5. A platform caller requests an address by `network` + suffix `pattern`.
 6. PostgreSQL locks one available row with `FOR UPDATE SKIP LOCKED`, preventing duplicate allocation under concurrency.
-7. The authenticated platform claims the assigned address. The API locks the row, decrypts it, deletes it in the same transaction, commits, and returns the private key once.
+7. The API creates a random one-time claim token, stores only its SHA-256 hash with a bounded lease expiry, and returns the plaintext token once with the allocated public address.
+8. Claim requires the same public address **and** the live one-time token. The API locks the row, verifies the token in constant time, decrypts the private key, deletes the row in the same transaction, commits, and returns the private key once.
+9. If the lease expires before claim, the encrypted row is safely returned to available inventory because its private key was never released.
 
 The KMS plaintext data-key buffer is zeroed after cryptographic use. Claimed keypairs are removed from the inventory table rather than retained as recoverable plaintext.
 
@@ -84,6 +90,8 @@ x-api-key: <PLATFORM_API_KEY>
 
 Allocation is transactional and network-scoped. A Solana address cannot accidentally satisfy an EVM request that happens to share the same suffix.
 
+Successful allocation returns the public address, a one-time `claimToken`, and `leaseExpiresAt`. The claim token must be treated as an ephemeral secret and must not be logged.
+
 ### Claim assigned address
 
 `POST /api/v1/claim_address`
@@ -98,11 +106,12 @@ Body:
 
 ```json
 {
-  "publicKey": "0x..."
+  "publicKey": "0x...",
+  "claimToken": "<one-time token returned by allocation>"
 }
 ```
 
-The claim path uses a row lock and transaction so concurrent callers cannot both release the same private key.
+The claim path uses a row lock and transaction so concurrent callers cannot both release the same private key. An expired or mismatched token fails without revealing whether the public address exists in assigned inventory.
 
 ## Local development
 
@@ -124,7 +133,7 @@ cd ..
 docker compose up --build
 ```
 
-The SQL bootstrap under `db/init/001_init.sql` creates the local inventory table on first database startup.
+The SQL bootstrap under `db/init/001_init.sql` creates the local inventory table on first database startup and includes forward-compatible claim-lease columns for existing deployments.
 
 ## Worker configuration
 
@@ -155,10 +164,10 @@ This repository demonstrates the application-layer controls, but a real deployme
 - Private database networking; never publish PostgreSQL directly.
 - Secret rotation and a managed secret store.
 - Least-privilege AWS IAM and KMS key policies.
-- Request logging that excludes request bodies and private-key material.
+- Request logging that excludes request bodies, private-key material and claim tokens.
 - Rate limiting / abuse controls appropriate to the deployment.
-- Monitoring and alerting around authentication failures, inventory anomalies and KMS failures.
-- A deliberate retention/recovery policy for assigned-but-unclaimed inventory.
+- Monitoring and alerting around authentication failures, inventory anomalies, lease churn and KMS failures.
+- A deliberate policy for lease duration, retry behavior and downstream handoff of claimed key material.
 
 ## Verification
 
@@ -172,4 +181,4 @@ GitHub Actions additionally runs the API quality gate and the repository credent
 
 ## Repository status
 
-Arcademinter is best read as a **security-conscious reference implementation / prototype** for vanity-address inventory infrastructure. The core KMS and concurrency model is implemented; production suitability still depends on the surrounding identity, network, deployment and operational controls described above.
+Arcademinter is best read as a **security-conscious reference implementation / prototype** for vanity-address inventory infrastructure. The core KMS, concurrency and one-time claim model is implemented; production suitability still depends on the surrounding identity, network, deployment and operational controls described above.
