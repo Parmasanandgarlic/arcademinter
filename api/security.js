@@ -25,4 +25,34 @@ function createApiKeyAuth({ envName, headerName = 'x-api-key', minimumLength = 3
   };
 }
 
-module.exports = { constantTimeEqual, createApiKeyAuth };
+function createClaimToken() {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+function hashClaimToken(token) {
+  if (typeof token !== 'string' || token.length < 32 || token.length > 256) return null;
+  return crypto.createHash('sha256').update(token, 'utf8').digest('hex');
+}
+
+function claimTokenMatches(token, expectedHash) {
+  const actualHash = hashClaimToken(token);
+  if (!actualHash || typeof expectedHash !== 'string' || !/^[0-9a-f]{64}$/i.test(expectedHash)) {
+    return false;
+  }
+  return constantTimeEqual(actualHash.toLowerCase(), expectedHash.toLowerCase());
+}
+
+function getClaimLeaseSeconds(raw = process.env.CLAIM_LEASE_SECONDS) {
+  const parsed = Number(raw ?? 600);
+  if (!Number.isInteger(parsed)) return 600;
+  return Math.min(Math.max(parsed, 60), 3600);
+}
+
+module.exports = {
+  constantTimeEqual,
+  createApiKeyAuth,
+  createClaimToken,
+  hashClaimToken,
+  claimTokenMatches,
+  getClaimLeaseSeconds,
+};
