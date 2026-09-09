@@ -17,7 +17,7 @@ Factory API
 ├── platform/key-delivery authentication
 ├── input validation
 ├── one-time claim-token issuance
-└── AWS KMS envelope encryption
+└── AWS KMS envelope encryption (SDK v3)
         │
         ▼
 PostgreSQL vanity-key inventory
@@ -42,7 +42,7 @@ The shared platform credential is not, by itself, sufficient to release an assig
 
 1. A miner generates a vanity keypair.
 2. The worker submits it over the authenticated worker endpoint.
-3. The API asks AWS KMS for an AES-256 data key.
+3. The API asks AWS KMS for an AES-256 data key through the modular AWS SDK v3 KMS client.
 4. The private key is encrypted locally with AES-256-GCM; only the KMS-encrypted data key and ciphertext are stored.
 5. A platform caller requests an address by `network` + suffix `pattern`.
 6. PostgreSQL locks one available row with `FOR UPDATE SKIP LOCKED`, preventing duplicate allocation under concurrency.
@@ -50,7 +50,7 @@ The shared platform credential is not, by itself, sufficient to release an assig
 8. Claim requires the same public address **and** the live one-time token. The API locks the row, verifies the token in constant time, decrypts the private key, deletes the row in the same transaction, commits, and returns the private key once.
 9. If the lease expires before claim, the encrypted row is safely returned to available inventory because its private key was never released.
 
-The KMS plaintext data-key buffer is zeroed after cryptographic use. Claimed keypairs are removed from the inventory table rather than retained as recoverable plaintext.
+The KMS plaintext data-key bytes are overwritten after cryptographic use. Incomplete KMS key-material responses fail closed rather than being passed into local encryption/decryption. Claimed keypairs are removed from the inventory table rather than retained as recoverable plaintext.
 
 ## API
 
@@ -137,7 +137,7 @@ The SQL bootstrap under `db/init/001_init.sql` creates the local inventory table
 
 ## Worker configuration
 
-The worker scripts no longer contain embedded endpoint credentials and never log raw miner output, because raw output can contain private-key material.
+The worker scripts do not contain embedded endpoint credentials and never log raw miner output, because raw output can contain private-key material.
 
 Provide runtime configuration instead:
 
@@ -154,7 +154,7 @@ Use the equivalent command for `solana-miner/run_miner.sh`.
 
 Prefer IAM roles, workload identity, task roles or another AWS default credential-provider-chain mechanism in deployed environments. Static `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` values are not required by the application and should not be baked into images or committed to Git.
 
-KMS permissions should be scoped to the single key and minimum required actions (`kms:GenerateDataKey`, `kms:Decrypt`).
+KMS permissions should be scoped to the single key and minimum required actions (`kms:GenerateDataKey`, `kms:Decrypt`). Arcademinter uses the modular `@aws-sdk/client-kms` package rather than the end-of-support monolithic AWS SDK v2 package.
 
 ## Production considerations
 
@@ -169,16 +169,28 @@ This repository demonstrates the application-layer controls, but a real deployme
 - Monitoring and alerting around authentication failures, inventory anomalies, lease churn and KMS failures.
 - A deliberate policy for lease duration, retry behavior and downstream handoff of claimed key material.
 
+## Security model
+
+- [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) documents assets, trust boundaries, security invariants and explicit non-goals.
+- [`SECURITY.md`](SECURITY.md) documents vulnerability reporting and credential-exposure handling.
+
+Examples use synthetic placeholders only. This repository does not claim that application-layer encryption alone creates a production custody boundary.
+
 ## Verification
 
 ```bash
 cd api
 npm test
 npm run check
+npm audit --omit=dev --audit-level=high
 ```
 
-GitHub Actions additionally runs the API quality gate and the repository credential/dependency audit on pull requests.
+GitHub Actions additionally runs the API quality gate and the repository credential/dependency audit on pull requests. The KMS tests use a synthetic injected v3-style client; they do not require live AWS credentials or real private keys.
 
 ## Repository status
 
 Arcademinter is best read as a **security-conscious reference implementation / prototype** for vanity-address inventory infrastructure. The core KMS, concurrency and one-time claim model is implemented; production suitability still depends on the surrounding identity, network, deployment and operational controls described above.
+
+## License
+
+ISC. See [`LICENSE`](LICENSE).
