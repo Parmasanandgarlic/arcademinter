@@ -38,28 +38,32 @@ function createKmsService({ client, keyId }) {
       response.Plaintext,
       'KMS GenerateDataKey response was incomplete.',
     );
-    const ciphertextBlob = requireBytes(
-      response.CiphertextBlob,
-      'KMS GenerateDataKey response was incomplete.',
-    );
 
-    const dataKey = Buffer.from(plaintext);
     try {
-      const iv = crypto.randomBytes(12);
-      const cipher = crypto.createCipheriv(ALGORITHM, dataKey, iv);
-      const encryptedPrivateKey = Buffer.concat([
-        cipher.update(Buffer.from(privateKey, 'utf8')),
-        cipher.final(),
-      ]);
+      const ciphertextBlob = requireBytes(
+        response.CiphertextBlob,
+        'KMS GenerateDataKey response was incomplete.',
+      );
+      const dataKey = Buffer.from(plaintext);
 
-      return {
-        encryptedDataKey: Buffer.from(ciphertextBlob).toString('base64'),
-        encryptedPrivateKey: encryptedPrivateKey.toString('base64'),
-        iv: iv.toString('base64'),
-        authTag: cipher.getAuthTag().toString('base64'),
-      };
+      try {
+        const iv = crypto.randomBytes(12);
+        const cipher = crypto.createCipheriv(ALGORITHM, dataKey, iv);
+        const encryptedPrivateKey = Buffer.concat([
+          cipher.update(Buffer.from(privateKey, 'utf8')),
+          cipher.final(),
+        ]);
+
+        return {
+          encryptedDataKey: Buffer.from(ciphertextBlob).toString('base64'),
+          encryptedPrivateKey: encryptedPrivateKey.toString('base64'),
+          iv: iv.toString('base64'),
+          authTag: cipher.getAuthTag().toString('base64'),
+        };
+      } finally {
+        dataKey.fill(0);
+      }
     } finally {
-      dataKey.fill(0);
       zeroBytes(plaintext);
     }
   }
