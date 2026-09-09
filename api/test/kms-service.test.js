@@ -49,3 +49,19 @@ test('KMS service fails closed when KMS responses omit required key material', a
     /KMS GenerateDataKey response was incomplete/,
   );
 });
+
+test('KMS plaintext is zeroed when GenerateDataKey returns only partial key material', async () => {
+  const plaintext = Buffer.alloc(32, 0x7a);
+  const client = {
+    async send() {
+      return { Plaintext: plaintext };
+    },
+  };
+  const service = createKmsService({ client, keyId: 'alias/arcademinter-test' });
+
+  await assert.rejects(
+    () => service.encryptKey('synthetic-private-key-material'),
+    /KMS GenerateDataKey response was incomplete/,
+  );
+  assert.equal(plaintext.every((byte) => byte === 0), true);
+});
